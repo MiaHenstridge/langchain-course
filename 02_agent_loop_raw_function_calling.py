@@ -1,17 +1,15 @@
 from dotenv import load_dotenv
 
-from langchain.chat_models import init_chat_model
-from langchain.tools import tool
-from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
+import ollama
 from langsmith import traceable
 
 load_dotenv()
 
 MAX_ITERATION = 10
-MODEL = "gemma4:12b"
+MODEL = "qwen3.5:9b"
 
-# Tools (Langchain @tool decorator)
-@tool
+# Tools (Without using langchain @tool decorator, these are just Python functions)
+@traceable(run_type="tool")
 def get_product_price(product: str) -> float:
     """
     Look up the price of a product in the catalog
@@ -27,8 +25,7 @@ def get_product_price(product: str) -> float:
     }
     return prices.get(product, 0)
 
-
-@tool
+@traceable(run_type="tool")
 def apply_discount(price: float, discount_tier: str) -> float:
     """Apply a discount tier to a price and return the final price
     Available tiers: bronze, silver, gold
@@ -38,23 +35,76 @@ def apply_discount(price: float, discount_tier: str) -> float:
     discount = discount_pct.get(discount_tier, 0)
     return round(price * (1-discount/100), 2)
 
+# We must manually define the JSON schema for each function. 
+# This is what langchain's @tool decorator generates automatically 
+# from the function's type hints and docstring
+tools_for_llm = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_product_price",
+            "description": "Look up the price of a product in the catalog",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "product": {
+                        "type": "string",
+                        "description": "The product name e.g., 'keyboard', 'keycap_set'",
+                    },
+                },
+                "required": ["product"],
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "apply_discount",
+            "description": "Apply a discount tier to a price and return the final price. Available tiers: bronze, silver, gold",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "price": {
+                        "type": "number",
+                        "description": "The original price",
+                    },
+                    "discount_tier": {
+                        "type": "string",
+                        "description": "The discount tier: 'bronze', 'silver', or 'gold'"
+                    },
+                },
+                "required": ["price", "discount_tier"],
+            }
+        }
+    },
+]
+
+
+# NOTE: Ollama can also auto-generate these schemas if you pass the functions directly as tools
+# but you would have to follow Google's docstring format in the function
+
+
+@traceable(name="Ollama chat", run_type="llm")
+def ollama_chat_traced(messages):
+    return ollama.chat(model=MODEL, tools=tools_for_llm, messages=messages)
+
 
 # Agent loop
-@traceable(name="LangChain Agent Loop")
+@traceable(name="Ollama Agent Loop")
 def run_agent(question: str):
     tools = [get_product_price, apply_discount]
     tools_dict = {
-        t.name: t for t in tools
+        "get_product_price": get_product_price,
+        "apply_discount": apply_discount,
     }
-    llm = init_chat_model(f"ollama:{MODEL}", temperature=0)
-    llm_with_tools = llm.bind_tools(tools)
 
     print(f"Question: {question}")
     print("="*60)
 
     messages = [
-        SystemMessage(
-            content=(
+        {
+            "role": "system",
+            "content": (
                 "You are a helpful shopping assistant."
                 "You have access to a product catalog tool and a discount tool.\n\n"
                 "STRICT RULES - you must follow these exactly:\n"
@@ -68,13 +118,18 @@ def run_agent(question: str):
                 "4. If the user does not specify a discount tier "
                 "ask them which discount tier to use - do NOT assume one."
             )
-        ),
-        HumanMessage(content=question)
+        },
+        {
+            "role": "user",
+            "content": question,
+        }
     ]
 
     for iteration in range(1, MAX_ITERATION+1):
         print(f"\n--- Iteration {iteration} ---")
-        ai_message = llm_with_tools.invoke(messages)
+        # use ollama.chat() directly instead of llm_with_tools.invoke()
+        response = ollama_chat_traced(messages=messages)
+        ai_message = response.message
         tool_calls = ai_message.tool_calls
         
         # if no tool calls, this is the final answer
@@ -84,21 +139,27 @@ def run_agent(question: str):
         
         # process only the FIRST tool call - force one tool per iteration
         tool_call = tool_calls[0]
-        tool_name = tool_call.get("name")
-        tool_args = tool_call.get("args", {})
-        tool_call_id = tool_call.get("id")
+        # attribute access instead of dict access
+        tool_name = tool_call.function.name
+        tool_args = tool_call.function.arguments
+        
         print(f"    [Tool selected] {tool_name} with args: {tool_args}")
         
         tool_to_use = tools_dict.get(tool_name)
         if tool_to_use is None:
             raise ValueError(f"Tool {tool_name} not found")
         
-        observation = tool_to_use.invoke(tool_args)
+        # direct function call instead of tool.invoke()
+        observation = tool_to_use(**tool_args)
         print(f"    [Tool result] {observation}")
 
         messages.append(ai_message)
+        # react loop: propagate the tool result back to the next iteration
         messages.append(
-            ToolMessage(content=observation, tool_call_id=tool_call_id)
+            {
+                "role": "tool",
+                "content": str(observation)
+            }
         )
     print(f"ERROR: Max iterations reached without a final answer")
     return None
