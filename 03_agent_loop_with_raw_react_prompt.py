@@ -151,15 +151,16 @@ def run_agent(question: str):
 
         print(f"    [Tool selected] {tool_name} with args: {tool_input_raw}")
 
-        # split comma-separated args: strip key= prefix if LLM outputs key=value format
-        raw_args = [x.strip() for x in tool_input_raw.split(",")]
-        args = [x.split("=", 1)[-1].strip().strip("'\"") for x in raw_args]
+        # split comma-separated args: strip key= prefix if LLM outputs key=value format (VERY FRAGILE, do NOT use in prod)
+        # raw_args = [x.strip() for x in tool_input_raw.split(",")]
+        # print(raw_args)
+        args = eval(tool_input_raw)
 
         print(f"  [Tool Executing] {tool_name}({args})...")
         if tool_name not in tools:
             observation = f"Error: Tool '{tool_name}' not found. Available tools: {list(tools.keys())}"
         else:
-            observation = str(tools[tool_name](*args))
+            observation = str(tools[tool_name](**args))
 
         print(f"    [Tool result] {observation}")
 
